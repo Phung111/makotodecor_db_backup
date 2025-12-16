@@ -169,20 +169,50 @@ $tempRestoreFile = Join-Path $backupDir "temp_restore_$(Get-Date -Format 'yyyyMM
 [System.IO.File]::WriteAllText($tempRestoreFile, $restoreScript, [System.Text.UTF8Encoding]::new($false))
 $tempRestoreName = Split-Path $tempRestoreFile -Leaf
 
-# Run restore
-docker run --rm `
+# Run restore and capture output
+Write-Host "Executing restore..." -ForegroundColor Yellow
+$restoreOutput = docker run --rm `
     -e PGPASSWORD=$DB_PASSWORD `
     -v "${backupDir}:/backup" `
     postgres:17 `
-    psql -h $DB_HOST -U $DB_USER -d $DB_NAME -f /backup/$tempRestoreName
+    psql -h $DB_HOST -U $DB_USER -d $DB_NAME -f /backup/$tempRestoreName 2>&1
+
+# Display output
+$restoreOutput | ForEach-Object { Write-Host $_ }
+
+# Check for errors in output (more reliable than exit code)
+$hasError = $false
+$restoreOutputString = $restoreOutput -join "`n"
+
+# Check for common error patterns
+if ($restoreOutputString -match "ERROR:\s+") {
+    $hasError = $true
+    Write-Host "`nERROR detected in restore output!" -ForegroundColor Red
+}
+
+# Check for ROLLBACK (indicates transaction failure)
+if ($restoreOutputString -match "ROLLBACK") {
+    $hasError = $true
+    Write-Host "`nTransaction was rolled back - restore failed!" -ForegroundColor Red
+}
+
+# Check exit code as well
+if ($LASTEXITCODE -ne 0) {
+    $hasError = $true
+    Write-Host "`npsql exited with error code: $LASTEXITCODE" -ForegroundColor Red
+}
 
 # Clean up temp file
 Remove-Item $tempRestoreFile -ErrorAction SilentlyContinue
 
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "`nRestore completed successfully!" -ForegroundColor Green
-} else {
-    Write-Host "`nRestore failed!" -ForegroundColor Red
-    Write-Host "Try using Method 2: .\restore-db-v2.ps1 $BackupFile 2" -ForegroundColor Yellow
+if ($hasError) {
+    Write-Host "`nRestore FAILED! Database was rolled back to previous state." -ForegroundColor Red
+    Write-Host "`nTroubleshooting tips:" -ForegroundColor Yellow
+    Write-Host "1. Check for circular foreign key constraints" -ForegroundColor Yellow
+    Write-Host "2. Verify table order in backup matches dependencies" -ForegroundColor Yellow
+    Write-Host "3. Try using Method 1: .\restore-db-v2.ps1 $BackupFile 1" -ForegroundColor Yellow
     exit 1
+} else {
+    Write-Host "`nRestore completed successfully!" -ForegroundColor Green
+    Write-Host "All data has been restored to the database." -ForegroundColor Green
 }

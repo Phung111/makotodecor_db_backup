@@ -51,21 +51,135 @@ $tableOrder = @(
     "flyway_schema_history" # No FK
 )
 
-# Build pg_dump command with table order
-$tableList = $tableOrder -join " -t public."
-$pgDumpCmd = "pg_dump -h $DB_HOST -U $DB_USER -d $DB_NAME --data-only --encoding=UTF8 -t public.$($tableList -replace ' ', ' -t public.') > /backup/$BACKUP_FILE"
-
+# Build pg_dump commands - dump each table separately to maintain order
+# pg_dump doesn't respect the order of multiple -t arguments, so we dump individually
 Write-Host "`nBacking up tables in dependency order..." -ForegroundColor Yellow
 Write-Host "Order: $($tableOrder -join ', ')" -ForegroundColor Cyan
 
-# Run pg_dump using Docker
-docker run --rm `
-    -e PGPASSWORD=$DB_PASSWORD `
-    -v "${currentDir}:/backup" `
-    postgres:17 `
-    sh -c $pgDumpCmd
+# Create header for backup file
+$headerSQL = @"
+--
+-- PostgreSQL database dump (Data Only - Ordered)
+-- Dumped from database version 17.7
+-- Dumped by pg_dump version 17.7
 
-if ($LASTEXITCODE -eq 0) {
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET transaction_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+"@
+
+# Write header to file
+[System.IO.File]::WriteAllText($BACKUP_FILE, $headerSQL, [System.Text.UTF8Encoding]::new($false))
+
+# Dump each table in order and append to file
+$backupFailed = $false
+foreach ($table in $tableOrder) {
+    Write-Host "  Dumping table: $table" -ForegroundColor Gray
+    $tempDumpFile = "temp_${table}_dump.sql"
+    
+    # Dump single table
+    docker run --rm `
+        -e PGPASSWORD=$DB_PASSWORD `
+        -v "${currentDir}:/backup" `
+        postgres:17 `
+        sh -c "pg_dump -h $DB_HOST -U $DB_USER -d $DB_NAME --data-only --encoding=UTF8 -t public.$table > /backup/$tempDumpFile"
+    
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $tempDumpFile)) {
+        # Read the temp dump file
+        $tableLines = Get-Content $tempDumpFile -Encoding UTF8
+        
+        # Extract COPY block and sequence set for this table
+        $inCopyBlock = $false
+        $copyBlock = @()
+        $sequenceBlock = @()
+        
+        foreach ($line in $tableLines) {
+            # Skip header lines (SET statements, etc.)
+            if ($line -match "^SET |^SELECT pg_catalog\.set_config|^--|^$") {
+                if (-not $inCopyBlock) {
+                    continue
+                }
+            }
+            
+            # Start of COPY block for this table
+            if ($line -match "COPY public\.$table") {
+                $inCopyBlock = $true
+                $copyBlock = @($line)
+                continue
+            }
+            
+            # End of COPY block
+            if ($inCopyBlock -and $line -match "^\\\.$") {
+                $copyBlock += $line
+                $inCopyBlock = $false
+                continue
+            }
+            
+            # Collect COPY data lines
+            if ($inCopyBlock) {
+                $copyBlock += $line
+                continue
+            }
+            
+            # Collect sequence set for this table
+            if ($line -match "SELECT pg_catalog\.setval.*$table") {
+                $sequenceBlock += $line
+            }
+        }
+        
+        # Append to backup file if we have data
+        if ($copyBlock.Count -gt 0) {
+            Add-Content -Path $BACKUP_FILE -Value "`n-- Data for Name: $table; Type: TABLE DATA; Schema: public; Owner: $DB_USER`n" -Encoding UTF8
+            $copyBlock | Add-Content -Path $BACKUP_FILE -Encoding UTF8
+        }
+        
+        # Append sequence set if exists
+        if ($sequenceBlock.Count -gt 0) {
+            Add-Content -Path $BACKUP_FILE -Value "`n-- Name: ${table}_id_seq; Type: SEQUENCE SET; Schema: public; Owner: $DB_USER`n" -Encoding UTF8
+            $sequenceBlock | Add-Content -Path $BACKUP_FILE -Encoding UTF8
+        }
+        
+        # Clean up temp file
+        Remove-Item $tempDumpFile -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "  Warning: Failed to dump table $table" -ForegroundColor Yellow
+        $backupFailed = $true
+    }
+}
+
+if ($backupFailed) {
+    Write-Host "`nSome tables failed to backup!" -ForegroundColor Red
+    exit 1
+}
+
+# Add footer
+$footerSQL = @"
+
+--
+-- PostgreSQL database dump complete
+--
+"@
+Add-Content -Path $BACKUP_FILE -Value $footerSQL -Encoding UTF8
+
+if (-not $backupFailed) {
+    # Remove \restrict and \unrestrict commands that cause issues in restore
+    Write-Host "`nCleaning up backup file..." -ForegroundColor Yellow
+    $content = Get-Content $BACKUP_FILE -Raw -Encoding UTF8
+    # Remove \restrict and \unrestrict lines
+    $content = $content -replace '(?m)^\\restrict.*$', '' -replace '(?m)^\\unrestrict.*$', ''
+    # Remove empty lines (more than 2 consecutive)
+    $content = $content -replace '(?m)^\s*$\r?\n', ''
+    [System.IO.File]::WriteAllText($BACKUP_FILE, $content, [System.Text.UTF8Encoding]::new($false))
+    
     $fileSize = (Get-Item $BACKUP_FILE).Length / 1MB
     Write-Host "`nBackup completed successfully!" -ForegroundColor Green
     Write-Host "File: $BACKUP_FILE" -ForegroundColor Green
