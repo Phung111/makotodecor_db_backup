@@ -1,17 +1,22 @@
-# Database Backup Script (Data Only - Ordered) using Docker
-# This script creates a backup with data ordered by dependency to avoid FK issues
-# Usage: .\backup-data-only-ordered.ps1
+# Database Backup Script for Flyway Flow (Data Only - Ordered) using Docker
+# This script creates a backup WITHOUT flyway_schema_history for use with Flyway migrations
+# Usage: .\backup-for-flyway.ps1
+#
+# Flow: backup -> drop-all -> run Java (Flyway) -> restore
+# NOTE: flyway_schema_history is EXCLUDED because Flyway will recreate it
 
 $DB_HOST = "ep-patient-heart-ahu35yr5-pooler.c-3.us-east-1.aws.neon.tech"
 $DB_USER = "neondb_owner"
 $DB_NAME = "neondb"
 $DB_PASSWORD = "npg_hlu8Cbiag6IY"
-$BACKUP_FILE = "backup_data_only_ordered_$(Get-Date -Format 'yyyyMMdd_HHmmss').sql"
+$BACKUP_FILE = "backup_for_flyway_$(Get-Date -Format 'yyyyMMdd_HHmmss').sql"
 
-Write-Host "Starting database backup (data only - ordered)..." -ForegroundColor Green
+Write-Host "Starting database backup for Flyway flow..." -ForegroundColor Green
 Write-Host "Host: $DB_HOST" -ForegroundColor Cyan
 Write-Host "Database: $DB_NAME" -ForegroundColor Cyan
 Write-Host "Output file: $BACKUP_FILE" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "NOTE: flyway_schema_history is EXCLUDED (Flyway will manage it)" -ForegroundColor Yellow
 
 # Check if Docker is running
 try {
@@ -34,12 +39,13 @@ $currentDir = (Get-Location).Path
 
 # Define table order based on dependencies (no FK -> FK tables)
 # Order: tables without FKs first, then tables with FKs
+# NOTE: flyway_schema_history is EXCLUDED - Flyway manages this table automatically
 $tableOrder = @(
     "access_counts",        # No FK
-    "flyway_schema_history",# No FK
+    # "flyway_schema_history" - EXCLUDED: Flyway will recreate this when running migrations
     "img_types",            # No FK
     "users",                # cart_id, order_id nullable
-    "imgs",                 # img_type_id nullable, product_id nullable
+    "imgs",                 # img_type_id nullable, product_id nullable (circular ref handled)
     "categories",           # img_id -> imgs
     "products",             # category_id -> categories
     "sizes",                # product_id -> products
@@ -60,10 +66,11 @@ Write-Host "Order: $($tableOrder -join ', ')" -ForegroundColor Cyan
 # Note: Tables are ordered by dependency to avoid FK constraint violations
 $headerSQL = @"
 --
--- PostgreSQL database dump (Data Only - Ordered by Dependencies)
+-- PostgreSQL database dump (Data Only - For Flyway Flow)
 -- Dumped from database version 17.7
 -- Dumped by pg_dump version 17.7
 -- Tables are ordered to respect foreign key constraints
+-- NOTE: flyway_schema_history is NOT included (Flyway manages it)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -250,7 +257,8 @@ Write-Host "  Tables skipped (not found): $tablesSkipped" -ForegroundColor DarkY
 $footerSQL = @"
 
 --
--- PostgreSQL database dump complete (ordered by dependencies)
+-- PostgreSQL database dump complete (for Flyway flow)
+-- flyway_schema_history NOT included
 --
 "@
 Add-Content -Path $BACKUP_FILE -Value $footerSQL -Encoding UTF8
@@ -268,5 +276,8 @@ $fileSize = (Get-Item $BACKUP_FILE).Length / 1MB
 Write-Host "`nBackup completed successfully!" -ForegroundColor Green
 Write-Host "File: $BACKUP_FILE" -ForegroundColor Green
 Write-Host "Size: $([math]::Round($fileSize, 2)) MB" -ForegroundColor Green
-Write-Host "`nNote: Tables are ordered by dependency. Circular references (imgs.product_id) are handled automatically." -ForegroundColor Cyan
-Write-Host "Use: .\restore-db-v2.ps1 $BACKUP_FILE 4" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "=== FLYWAY FLOW ===" -ForegroundColor Yellow
+Write-Host "1. .\drop-all.ps1                              # Drop all schema" -ForegroundColor Cyan
+Write-Host "2. Run Java app (Flyway creates schema + base data)" -ForegroundColor Cyan
+Write-Host "3. .\restore-db.ps1 $BACKUP_FILE 4  # Restore data" -ForegroundColor Cyan
