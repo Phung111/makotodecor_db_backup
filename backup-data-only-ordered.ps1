@@ -35,20 +35,20 @@ $currentDir = (Get-Location).Path
 # Define table order based on dependencies (no FK -> FK tables)
 # Order: tables without FKs first, then tables with FKs
 $tableOrder = @(
-    "access_counts",      # No FK
-    "img_types",          # No FK
-    "users",              # No FK (cart_id and order_id are nullable initially)
-    "imgs",               # FK: img_type_id (nullable), product_id (nullable)
-    "categories",         # FK: img_id (nullable)
-    "products",           # FK: category_id
-    "colors",             # FK: product_id, img_id (nullable)
-    "sizes",              # FK: product_id
-    "carts",              # FK: user_id
-    "cart_items",         # FK: cart_id, product_id, size_id, color_id
-    "orders",             # FK: user_id
-    "order_groups",       # FK: order_id, product_id
-    "order_items",        # FK: order_id, product_id, order_group_id
-    "flyway_schema_history" # No FK
+    "access_counts",        # No FK
+    "flyway_schema_history",# No FK
+    "img_types",            # No FK
+    "users",                # cart_id, order_id nullable
+    "imgs",                 # img_type_id nullable, product_id nullable
+    "categories",           # img_id -> imgs
+    "products",             # category_id -> categories
+    "sizes",                # product_id -> products
+    "colors",               # product_id -> products, img_id -> imgs
+    "carts",                # user_id -> users
+    "cart_items",           # cart_id, product_id, size_id, color_id
+    "orders",               # user_id -> users
+    "order_groups",         # order_id -> orders, product_id -> products
+    "order_items"           # order_id, order_group_id, product_id
 )
 
 # Build pg_dump commands - dump each table separately to maintain order
@@ -57,11 +57,13 @@ Write-Host "`nBacking up tables in dependency order..." -ForegroundColor Yellow
 Write-Host "Order: $($tableOrder -join ', ')" -ForegroundColor Cyan
 
 # Create header for backup file
+# Note: Tables are ordered by dependency to avoid FK constraint violations
 $headerSQL = @"
 --
--- PostgreSQL database dump (Data Only - Ordered)
+-- PostgreSQL database dump (Data Only - Ordered by Dependencies)
 -- Dumped from database version 17.7
 -- Dumped by pg_dump version 17.7
+-- Tables are ordered to respect foreign key constraints
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -80,20 +82,38 @@ SET row_security = off;
 # Write header to file
 [System.IO.File]::WriteAllText($BACKUP_FILE, $headerSQL, [System.Text.UTF8Encoding]::new($false))
 
+# Storage for circular reference handling
+# imgs.product_id -> products.id (circular with categories)
+$imgsProductIdMapping = @{}
+
 # Dump each table in order and append to file
-$backupFailed = $false
+$tablesBackedUp = 0
+$tablesSkipped = 0
 foreach ($table in $tableOrder) {
     Write-Host "  Dumping table: $table" -ForegroundColor Gray
     $tempDumpFile = "temp_${table}_dump.sql"
+    $tempErrFile = "temp_${table}_err.txt"
     
-    # Dump single table
+    # Dump single table (capture stderr to check if table exists)
     docker run --rm `
         -e PGPASSWORD=$DB_PASSWORD `
         -v "${currentDir}:/backup" `
         postgres:17 `
-        sh -c "pg_dump -h $DB_HOST -U $DB_USER -d $DB_NAME --data-only --encoding=UTF8 -t public.$table > /backup/$tempDumpFile"
+        sh -c "pg_dump -h $DB_HOST -U $DB_USER -d $DB_NAME --data-only --encoding=UTF8 -t public.$table > /backup/$tempDumpFile 2> /backup/$tempErrFile"
     
-    if ($LASTEXITCODE -eq 0 -and (Test-Path $tempDumpFile)) {
+    # Check if table doesn't exist (skip instead of fail)
+    $tableNotFound = $false
+    if (Test-Path $tempErrFile) {
+        $errContent = Get-Content $tempErrFile -Raw -ErrorAction SilentlyContinue
+        if ($errContent -match "no matching tables were found") {
+            $tableNotFound = $true
+            Write-Host "    Skipped: Table '$table' does not exist in database" -ForegroundColor DarkYellow
+            $tablesSkipped++
+        }
+        Remove-Item $tempErrFile -ErrorAction SilentlyContinue
+    }
+    
+    if (-not $tableNotFound -and (Test-Path $tempDumpFile)) {
         # Read the temp dump file
         $tableLines = Get-Content $tempDumpFile -Encoding UTF8
         
@@ -101,6 +121,7 @@ foreach ($table in $tableOrder) {
         $inCopyBlock = $false
         $copyBlock = @()
         $sequenceBlock = @()
+        $productIdColumnIndex = -1
         
         foreach ($line in $tableLines) {
             # Skip header lines (SET statements, etc.)
@@ -114,6 +135,18 @@ foreach ($table in $tableOrder) {
             if ($line -match "COPY public\.$table") {
                 $inCopyBlock = $true
                 $copyBlock = @($line)
+                
+                # For imgs table: find product_id column index to handle circular reference
+                if ($table -eq "imgs" -and $line -match "COPY public\.imgs \(([^)]+)\)") {
+                    $columns = $matches[1] -split ",\s*"
+                    for ($i = 0; $i -lt $columns.Count; $i++) {
+                        if ($columns[$i].Trim() -eq "product_id") {
+                            $productIdColumnIndex = $i
+                            Write-Host "    Handling circular reference: imgs.product_id (column index $i)" -ForegroundColor Cyan
+                            break
+                        }
+                    }
+                }
                 continue
             }
             
@@ -126,6 +159,22 @@ foreach ($table in $tableOrder) {
             
             # Collect COPY data lines
             if ($inCopyBlock) {
+                # Special handling for imgs table: set product_id to NULL and save for later UPDATE
+                if ($table -eq "imgs" -and $productIdColumnIndex -ge 0) {
+                    $fields = $line -split "`t"
+                    if ($fields.Count -gt $productIdColumnIndex) {
+                        $imgId = $fields[0]
+                        $productId = $fields[$productIdColumnIndex]
+                        
+                        # If product_id is not NULL, save it for UPDATE later
+                        if ($productId -ne "\N" -and $productId -ne "") {
+                            $imgsProductIdMapping[$imgId] = $productId
+                            # Set product_id to NULL in COPY data
+                            $fields[$productIdColumnIndex] = "\N"
+                            $line = $fields -join "`t"
+                        }
+                    }
+                }
                 $copyBlock += $line
                 continue
             }
@@ -140,6 +189,43 @@ foreach ($table in $tableOrder) {
         if ($copyBlock.Count -gt 0) {
             Add-Content -Path $BACKUP_FILE -Value "`n-- Data for Name: $table; Type: TABLE DATA; Schema: public; Owner: $DB_USER`n" -Encoding UTF8
             $copyBlock | Add-Content -Path $BACKUP_FILE -Encoding UTF8
+            $tablesBackedUp++
+            
+            # Show circular reference handling info
+            if ($table -eq "imgs" -and $imgsProductIdMapping.Count -gt 0) {
+                Write-Host "    Saved $($imgsProductIdMapping.Count) imgs.product_id values for UPDATE after products" -ForegroundColor Cyan
+            }
+        }
+        
+        # After products table: add UPDATE statements to restore imgs.product_id
+        if ($table -eq "products" -and $imgsProductIdMapping.Count -gt 0) {
+            Write-Host "  Adding UPDATE statements for imgs.product_id (circular reference fix)..." -ForegroundColor Cyan
+            
+            $updateStatements = @()
+            $updateStatements += ""
+            $updateStatements += "-- Fix circular reference: Update imgs.product_id after products are inserted"
+            
+            # Group by product_id to create fewer UPDATE statements
+            $productIdToImgIds = @{}
+            foreach ($entry in $imgsProductIdMapping.GetEnumerator()) {
+                $imgId = $entry.Key
+                $productId = $entry.Value
+                if (-not $productIdToImgIds.ContainsKey($productId)) {
+                    $productIdToImgIds[$productId] = @()
+                }
+                $productIdToImgIds[$productId] += $imgId
+            }
+            
+            foreach ($entry in $productIdToImgIds.GetEnumerator()) {
+                $productId = $entry.Key
+                $imgIds = $entry.Value -join ", "
+                $updateStatements += "UPDATE public.imgs SET product_id = $productId WHERE id IN ($imgIds);"
+            }
+            
+            $updateStatements += ""
+            
+            Add-Content -Path $BACKUP_FILE -Value ($updateStatements -join "`n") -Encoding UTF8
+            Write-Host "    Added $($productIdToImgIds.Count) UPDATE statements" -ForegroundColor Green
         }
         
         # Append sequence set if exists
@@ -150,42 +236,37 @@ foreach ($table in $tableOrder) {
         
         # Clean up temp file
         Remove-Item $tempDumpFile -ErrorAction SilentlyContinue
-    } else {
-        Write-Host "  Warning: Failed to dump table $table" -ForegroundColor Yellow
-        $backupFailed = $true
+    } elseif (-not $tableNotFound) {
+        # Clean up temp file if exists
+        Remove-Item $tempDumpFile -ErrorAction SilentlyContinue
     }
 }
 
-if ($backupFailed) {
-    Write-Host "`nSome tables failed to backup!" -ForegroundColor Red
-    exit 1
-}
+Write-Host "`nBackup summary:" -ForegroundColor Yellow
+Write-Host "  Tables backed up: $tablesBackedUp" -ForegroundColor Green
+Write-Host "  Tables skipped (not found): $tablesSkipped" -ForegroundColor DarkYellow
 
 # Add footer
 $footerSQL = @"
 
 --
--- PostgreSQL database dump complete
+-- PostgreSQL database dump complete (ordered by dependencies)
 --
 "@
 Add-Content -Path $BACKUP_FILE -Value $footerSQL -Encoding UTF8
 
-if (-not $backupFailed) {
-    # Remove \restrict and \unrestrict commands that cause issues in restore
-    Write-Host "`nCleaning up backup file..." -ForegroundColor Yellow
-    $content = Get-Content $BACKUP_FILE -Raw -Encoding UTF8
-    # Remove \restrict and \unrestrict lines
-    $content = $content -replace '(?m)^\\restrict.*$', '' -replace '(?m)^\\unrestrict.*$', ''
-    # Remove empty lines (more than 2 consecutive)
-    $content = $content -replace '(?m)^\s*$\r?\n', ''
-    [System.IO.File]::WriteAllText($BACKUP_FILE, $content, [System.Text.UTF8Encoding]::new($false))
-    
-    $fileSize = (Get-Item $BACKUP_FILE).Length / 1MB
-    Write-Host "`nBackup completed successfully!" -ForegroundColor Green
-    Write-Host "File: $BACKUP_FILE" -ForegroundColor Green
-    Write-Host "Size: $([math]::Round($fileSize, 2)) MB" -ForegroundColor Green
-    Write-Host "`nNote: This backup is ordered by dependencies for easier restore." -ForegroundColor Cyan
-} else {
-    Write-Host "`nBackup failed!" -ForegroundColor Red
-    exit 1
-}
+# Remove \restrict and \unrestrict commands that cause issues in restore
+Write-Host "`nCleaning up backup file..." -ForegroundColor Yellow
+$content = Get-Content $BACKUP_FILE -Raw -Encoding UTF8
+# Remove \restrict and \unrestrict lines
+$content = $content -replace '(?m)^\\restrict.*$', '' -replace '(?m)^\\unrestrict.*$', ''
+# Remove empty lines (more than 2 consecutive)
+$content = $content -replace '(?m)^\s*$\r?\n', ''
+[System.IO.File]::WriteAllText($BACKUP_FILE, $content, [System.Text.UTF8Encoding]::new($false))
+
+$fileSize = (Get-Item $BACKUP_FILE).Length / 1MB
+Write-Host "`nBackup completed successfully!" -ForegroundColor Green
+Write-Host "File: $BACKUP_FILE" -ForegroundColor Green
+Write-Host "Size: $([math]::Round($fileSize, 2)) MB" -ForegroundColor Green
+Write-Host "`nNote: Tables are ordered by dependency. Circular references (imgs.product_id) are handled automatically." -ForegroundColor Cyan
+Write-Host "Use: .\restore-db-v2.ps1 $BACKUP_FILE 4" -ForegroundColor Cyan

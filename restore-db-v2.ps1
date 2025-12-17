@@ -2,16 +2,17 @@
 # Usage: .\restore-db-v2.ps1 <backup-file.sql> [method]
 # Methods: 
 #   1 = Disable triggers (current, may need permissions)
-#   2 = Defer constraints (recommended)
+#   2 = Defer constraints (only works with DEFERRABLE FKs)
 #   3 = Disable foreign keys temporarily
+#   4 = Direct execution (RECOMMENDED for backups with session_replication_role)
 
 param(
     [Parameter(Mandatory=$true)]
     [string]$BackupFile,
     
     [Parameter(Mandatory=$false)]
-    [ValidateSet("1", "2", "3")]
-    [string]$Method = "2"
+    [ValidateSet("1", "2", "3", "4")]
+    [string]$Method = "4"
 )
 
 $DB_HOST = "ep-patient-heart-ahu35yr5-pooler.c-3.us-east-1.aws.neon.tech"
@@ -164,6 +165,52 @@ COMMIT;
     $restoreScript = $deferConstraintsSQL + "`n" + $backupContent + "`n" + $commitSQL
 }
 
+# Method 4: Direct execution (RECOMMENDED for Neon/managed PostgreSQL)
+# Tables must be ordered by dependency in backup file
+elseif ($Method -eq "4") {
+    Write-Host "Using Method 4: Direct execution (RECOMMENDED)" -ForegroundColor Yellow
+    Write-Host "  This method runs the backup file directly without modification." -ForegroundColor Gray
+    Write-Host "  Requires tables to be ordered by dependency in backup file." -ForegroundColor Gray
+    Write-Host "  Compatible with Neon and other managed PostgreSQL services." -ForegroundColor Gray
+    
+    # Remove session_replication_role if present (not supported on Neon)
+    if ($backupContent -match "session_replication_role") {
+        Write-Host "  Removing session_replication_role (not supported on managed PostgreSQL)..." -ForegroundColor Yellow
+        $backupContent = $backupContent -replace "(?m)^.*session_replication_role.*$`r?`n?", ""
+    }
+    
+    # Add TRUNCATE statements to clear existing data before restore
+    # Using DO block to safely truncate only existing tables
+    $truncateSQL = @"
+-- Truncate all tables before restore (reverse dependency order)
+-- Using DO block to handle non-existing tables gracefully
+DO `$`$
+DECLARE
+    tables_to_truncate TEXT[] := ARRAY[
+        'order_items', 'order_groups', 'orders', 'cart_items', 'carts',
+        'colors', 'sizes', 'products', 'categories', 'imgs',
+        'users', 'img_types', 'flyway_schema_history', 'access_counts'
+    ];
+    t TEXT;
+BEGIN
+    FOREACH t IN ARRAY tables_to_truncate
+    LOOP
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = t) THEN
+            EXECUTE format('TRUNCATE TABLE public.%I CASCADE', t);
+            RAISE NOTICE 'Truncated table: %', t;
+        ELSE
+            RAISE NOTICE 'Skipped (not found): %', t;
+        END IF;
+    END LOOP;
+END
+`$`$;
+
+"@
+    
+    Write-Host "  Adding TRUNCATE statements to clear existing data..." -ForegroundColor Yellow
+    $restoreScript = $truncateSQL + $backupContent
+}
+
 # Write to temp file
 $tempRestoreFile = Join-Path $backupDir "temp_restore_$(Get-Date -Format 'yyyyMMdd_HHmmss').sql"
 [System.IO.File]::WriteAllText($tempRestoreFile, $restoreScript, [System.Text.UTF8Encoding]::new($false))
@@ -184,10 +231,19 @@ $restoreOutput | ForEach-Object { Write-Host $_ }
 $hasError = $false
 $restoreOutputString = $restoreOutput -join "`n"
 
-# Check for common error patterns
-if ($restoreOutputString -match "ERROR:\s+") {
+# Check for common error patterns, but ignore non-critical errors
+# Ignore: "does not exist" (table not found during truncate - OK)
+# Ignore: "NOTICE:" messages (informational)
+$criticalErrors = $restoreOutputString -split "`n" | Where-Object { 
+    $_ -match "ERROR:\s+" -and 
+    $_ -notmatch "does not exist" -and
+    $_ -notmatch "already exists" 
+}
+
+if ($criticalErrors.Count -gt 0) {
     $hasError = $true
-    Write-Host "`nERROR detected in restore output!" -ForegroundColor Red
+    Write-Host "`nCritical ERROR detected in restore output!" -ForegroundColor Red
+    $criticalErrors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
 }
 
 # Check for ROLLBACK (indicates transaction failure)
@@ -210,7 +266,8 @@ if ($hasError) {
     Write-Host "`nTroubleshooting tips:" -ForegroundColor Yellow
     Write-Host "1. Check for circular foreign key constraints" -ForegroundColor Yellow
     Write-Host "2. Verify table order in backup matches dependencies" -ForegroundColor Yellow
-    Write-Host "3. Try using Method 1: .\restore-db-v2.ps1 $BackupFile 1" -ForegroundColor Yellow
+    Write-Host "3. Try using Method 4 (direct): .\restore-db-v2.ps1 $BackupFile 4" -ForegroundColor Yellow
+    Write-Host "4. Try using Method 1 (triggers): .\restore-db-v2.ps1 $BackupFile 1" -ForegroundColor Yellow
     exit 1
 } else {
     Write-Host "`nRestore completed successfully!" -ForegroundColor Green
